@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+env:
+  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
+  XDG_CONFIG_HOME: ${{ github.workspace }}/.config
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./infra
+
+    outputs:
+      kubeconfig: ${{ steps.apply.outputs.kubeconfig_path }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set environment variables
+        run: |
+          # Short name for current branch. For PRs, use source branch.
+          GIT_BRANCH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
+          echo "GIT_BRANCH=$GIT_BRANCH" >> $GITHUB_ENV
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.0.7
+          terraform_wrapper: false
+
+      - name: Create Terraform Plugin Cache Dir
+        run: mkdir --parents $TF_PLUGIN_CACHE_DIR
+
+      - name: Cache Terraform Dependencies
+        uses: actions/cache@v2
+        id: cache
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+
+      - name: Terraform Init
+        id: init
+        run: terraform init
+
+      - name: Terraform Workspace
+        id: workspace
+        run: terraform workspace select $GIT_BRANCH || terraform workspace new $GIT_BRANCH
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -out tfplan
+
+      - name: Terraform Apply
+        id: apply
+        run: |
+          terraform apply -no-color -auto-approve tfplan
+          echo "::set-output name=kubeconfig_path::$(terraform output -raw kubeconfig_path)"
+
+  bigbang:
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set environment variables
+        run: |
+          # Short name for current branch. For PRs, use source branch.
+          GIT_BRANCH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
+          echo "GIT_BRANCH=$GIT_BRANCH" >> $GITHUB_ENV
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Install Kubectl
+        uses: azure/setup-kubectl@v1
+        id: install
+
+      - name: Download Kubernetes Config
+        run: |
+          mkdir --parent $HOME/.kube
+          aws s3 cp ${{ needs.terraform.outputs.kubeconfig }} $HOME/.kube/config
+
+      - name: Verify connectivity
+        run: kubectl get nodes
+
+      - name: Install Kustomize
+        run: |
+          export KUSTOMIZE_VERSION=4.4.0
+          export KUSTOMIZE_URL=https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/v${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz
+          curl -sSL ${KUSTOMIZE_URL} -o - | tar -xz -C /usr/local/bin
+
+      - name: Install Flux
+        run: kustomize build --enable-alpha-plugins flux | kubectl apply -f -
+
+  
